@@ -4,6 +4,7 @@ import pandas as pd
 import json
 from datetime import datetime, date, timedelta
 import io
+import time
 
 # ── PAGE CONFIG ──────────────────────────────────────────────────────────────
 
@@ -45,23 +46,26 @@ hr { border-color: #21262d !important; margin: 1.5rem 0; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: #0d1117; }
 ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+.chunk-info { font-size: 0.78rem; color: #484f58; font-family: 'IBM Plex Mono', monospace; padding: 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── CONSTANTS ────────────────────────────────────────────────────────────────
 
-API_URL = "https://static-scanx.dhan.co/staticscanx/fiidiidata"
+API_URL       = "https://static-scanx.dhan.co/staticscanx/fiidiidata"
+MAX_HOURS     = 990          # API limit is 1000 hrs; use 990 for safety
+MAX_DAYS      = MAX_HOURS // 24   # = 41 days per chunk
 
 SEGMENT_OPTIONS = {
-    "Equity": "equity",
-    "Futures & Options": "fno",
-    "Debt": "debt",
-    "Hybrid": "hybrid",
+    "Equity":             "equity",
+    "Futures & Options":  "fno",
+    "Debt":               "debt",
+    "Hybrid":             "hybrid",
 }
 
 TIMEFRAME_OPTIONS = {
-    "Daily": "D",
-    "Weekly": "W",
+    "Daily":   "D",
+    "Weekly":  "W",
     "Monthly": "M",
 }
 
@@ -76,18 +80,23 @@ if "last_raw" not in st.session_state:
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
-def build_payload(segment, from_dt, to_dt, timeframe):
+def date_chunks(from_dt: date, to_dt: date, chunk_days: int = MAX_DAYS):
     """
-    Exact structure confirmed from DevTools Payload tab:
-    {
-      "data": {
-        "startdate":   "28-03-2026",   <- DD-MM-YYYY
-        "enddate":     "28-04-2026",
-        "defaultpage": "N",
-        "segment":     "equity",
-        "TimeFrame":   "D"
-      }
-    }
+    Split a wide date range into consecutive chunks of at most chunk_days.
+    Yields (chunk_start, chunk_end) pairs as date objects.
+    """
+    current = from_dt
+    while current <= to_dt:
+        end = min(current + timedelta(days=chunk_days - 1), to_dt)
+        yield current, end
+        current = end + timedelta(days=1)
+
+
+def build_payload(segment: str, from_dt: date, to_dt: date, timeframe: str) -> dict:
+    """
+    Exact structure confirmed from DevTools:
+    { "data": { "startdate": "DD-MM-YYYY", "enddate": "DD-MM-YYYY",
+                "defaultpage": "N", "segment": "equity", "TimeFrame": "D" } }
     """
     return {
         "data": {
@@ -100,13 +109,13 @@ def build_payload(segment, from_dt, to_dt, timeframe):
     }
 
 
-def fetch_fiidii(token, payload):
+def fetch_single(token: str, payload: dict):
     hdrs = {
-        "Auth": token.strip(),
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://scanx.trade",
-        "Referer": "https://scanx.trade/insight/fii-dii-data",
+        "Auth":           token.strip(),
+        "Content-Type":   "application/json",
+        "Accept":         "application/json, text/plain, */*",
+        "Origin":         "https://scanx.trade",
+        "Referer":        "https://scanx.trade/insight/fii-dii-data",
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -116,17 +125,20 @@ def fetch_fiidii(token, payload):
     return requests.post(API_URL, headers=hdrs, json=payload, timeout=15)
 
 
-def parse_response(data):
-    if isinstance(data, list):
-        return pd.DataFrame(data)
-    if isinstance(data, dict):
+def parse_records(raw) -> list:
+    """Extract a list of record dicts from whatever shape the API returns."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        # check known wrapper keys
         for key in ["data", "result", "records", "fiidii", "response"]:
-            if key in data and isinstance(data[key], list):
-                return pd.DataFrame(data[key])
-        for v in data.values():
-            if isinstance(v, list) and len(v) > 0:
-                return pd.DataFrame(v)
-    return pd.DataFrame()
+            if key in raw and isinstance(raw[key], list):
+                return raw[key]
+        # fallback: first list value
+        for v in raw.values():
+            if isinstance(v, list):
+                return v
+    return []
 
 
 def color_net(val):
@@ -141,11 +153,11 @@ def color_net(val):
     return ""
 
 
-def df_to_csv(df):
+def df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
-def df_to_excel(df):
+def df_to_excel(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="FII_DII_Data")
@@ -176,25 +188,57 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📅 Date Range")
+
+    # Preset shortcuts
+    preset = st.radio(
+        "Quick range",
+        ["Last 30 days", "Last 90 days", "Last 6 months", "Last 1 year", "Custom"],
+        index=0,
+        horizontal=False,
+        label_visibility="collapsed",
+    )
+
+    today = date.today()
+    if preset == "Last 30 days":
+        default_from, default_to = today - timedelta(days=30), today
+    elif preset == "Last 90 days":
+        default_from, default_to = today - timedelta(days=90), today
+    elif preset == "Last 6 months":
+        default_from, default_to = today - timedelta(days=182), today
+    elif preset == "Last 1 year":
+        default_from, default_to = today - timedelta(days=365), today
+    else:
+        default_from, default_to = today - timedelta(days=30), today
+
     col1, col2 = st.columns(2)
     with col1:
-        from_date = st.date_input("From", value=date.today() - timedelta(days=30))
+        from_date = st.date_input("From", value=default_from)
     with col2:
-        to_date = st.date_input("To", value=date.today())
+        to_date = st.date_input("To", value=default_to)
+
+    # Show chunk count warning
+    total_days = (to_date - from_date).days + 1
+    n_chunks = -(-total_days // MAX_DAYS)   # ceiling division
+    if n_chunks > 1:
+        st.info(
+            f"⚡ Range is **{total_days} days** — will be fetched in "
+            f"**{n_chunks} chunks** of ≤{MAX_DAYS} days each.",
+            icon="ℹ️",
+        )
 
     st.markdown("---")
     st.markdown("### 📂 Segment")
-    segment_label = st.selectbox("Market segment", list(SEGMENT_OPTIONS.keys()))
-    segment_val = SEGMENT_OPTIONS[segment_label]
+    segment_label   = st.selectbox("Market segment", list(SEGMENT_OPTIONS.keys()))
+    segment_val     = SEGMENT_OPTIONS[segment_label]
 
     st.markdown("### 🕐 Time Frame")
     timeframe_label = st.selectbox("Frequency", list(TIMEFRAME_OPTIONS.keys()))
-    timeframe_val = TIMEFRAME_OPTIONS[timeframe_label]
+    timeframe_val   = TIMEFRAME_OPTIONS[timeframe_label]
 
     st.markdown("---")
     st.markdown("### 🔧 Advanced")
     with st.expander("Custom Payload (JSON override)"):
-        st.markdown("Overrides the auto-built payload. Leave empty to use defaults above.")
+        st.markdown("Overrides auto-built payload. Chunking is **disabled** when using custom payload.")
         custom_payload_str = st.text_area(
             "Custom JSON",
             height=160,
@@ -219,6 +263,7 @@ with st.sidebar:
     st.markdown(
         "<div style='font-size:0.7rem; color:#484f58; text-align:center;'>"
         "Source: static-scanx.dhan.co<br>"
+        "API limit: 1000 hrs (~41 days) per request<br>"
         "JWT token expires with each session"
         "</div>",
         unsafe_allow_html=True,
@@ -252,7 +297,8 @@ with st.expander("📖 How to get your Auth token", expanded=False):
 7. Paste it in the sidebar → set your date range → click **Fetch Data**
 
 > ⚠️ The token **expires** when you log out or after some time — grab a fresh one as needed.  
-> 📅 Dates are sent as **DD-MM-YYYY** (e.g. `28-04-2026`) — this is handled automatically.
+> 📅 Dates are sent as **DD-MM-YYYY** — handled automatically.  
+> 🔢 API limit is **1000 hours (~41 days)** per call — larger ranges are auto-split.
 """)
 
 st.markdown("---")
@@ -265,57 +311,131 @@ if fetch_btn:
     elif from_date > to_date:
         st.error("⚠️ 'From' date must be earlier than 'To' date.")
     else:
+        # Custom payload path (single call, no chunking)
         if custom_payload_str.strip():
             try:
-                payload = json.loads(custom_payload_str)
+                custom_payload = json.loads(custom_payload_str)
             except json.JSONDecodeError as e:
                 st.error(f"Invalid JSON in custom payload: {e}")
                 st.stop()
+
+            with st.spinner("Fetching with custom payload..."):
+                try:
+                    resp = fetch_single(token, custom_payload)
+                    if resp.status_code == 200:
+                        raw = resp.json()
+                        records = parse_records(raw)
+                        df = pd.DataFrame(records)
+                        st.session_state.last_df = df
+                        st.session_state.last_raw = raw
+                        st.success(f"✅ Fetched **{len(df)} records**")
+                    elif resp.status_code == 401:
+                        st.error("🔐 401 Unauthorized — token expired.")
+                    else:
+                        st.error(f"❌ HTTP {resp.status_code}: {resp.text[:300]}")
+                        st.json(resp.json())
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
         else:
-            payload = build_payload(segment_val, from_date, to_date, timeframe_val)
+            # Auto-chunked path
+            chunks = list(date_chunks(from_date, to_date))
+            total  = len(chunks)
+            ts     = datetime.now().strftime("%H:%M:%S")
 
-        with st.spinner(f"Fetching {segment_label} ({timeframe_label}) data..."):
-            try:
-                resp = fetch_fiidii(token, payload)
-                ts = datetime.now().strftime("%H:%M:%S")
+            if total == 1:
+                status_msg = st.empty()
+            else:
+                status_msg = st.empty()
+                prog_bar   = st.progress(0, text=f"Fetching chunk 1 / {total}...")
 
-                if resp.status_code == 200:
-                    raw = resp.json()
-                    df = parse_response(raw)
-                    st.session_state.last_df = df
-                    st.session_state.last_raw = raw
-                    st.session_state.fetch_history.append({
-                        "Time": ts,
-                        "Segment": segment_label,
-                        "TimeFrame": timeframe_label,
-                        "From": from_date.strftime("%d-%m-%Y"),
-                        "To": to_date.strftime("%d-%m-%Y"),
-                        "Rows": len(df),
-                        "Status": "✅ OK",
-                    })
-                    st.success(f"✅ Fetched **{len(df)} records** at {ts}")
+            all_records = []
+            all_raws    = []
+            error_flag  = False
 
-                elif resp.status_code == 401:
-                    st.error("🔐 **401 Unauthorized** — Token has expired. Grab a fresh one from DevTools.")
-                    st.session_state.fetch_history.append({
-                        "Time": ts, "Segment": segment_label, "TimeFrame": timeframe_label,
-                        "From": "", "To": "", "Rows": 0, "Status": "❌ 401",
-                    })
-                elif resp.status_code == 403:
-                    st.error("🚫 **403 Forbidden** — Make sure you're logged in to ScanX.")
+            for i, (chunk_start, chunk_end) in enumerate(chunks):
+                label = (
+                    f"Fetching {segment_label} ({timeframe_label}): "
+                    f"{chunk_start.strftime('%d-%m-%Y')} → {chunk_end.strftime('%d-%m-%Y')} "
+                    f"[{i+1}/{total}]"
+                )
+                if total > 1:
+                    prog_bar.progress((i) / total, text=label)
                 else:
-                    st.error(f"❌ HTTP {resp.status_code}: {resp.text[:400]}")
+                    status_msg.info(f"⏳ {label}")
 
-            except requests.exceptions.ConnectionError:
-                st.error("🌐 Connection error — check your internet connection.")
-            except requests.exceptions.Timeout:
-                st.error("⏱️ Request timed out (15s). Please try again.")
-            except Exception as e:
-                st.error(f"Unexpected error: {e}")
+                payload = build_payload(segment_val, chunk_start, chunk_end, timeframe_val)
+
+                try:
+                    resp = fetch_single(token, payload)
+
+                    if resp.status_code == 401:
+                        st.error("🔐 **401 Unauthorized** — Token has expired. Grab a fresh one from DevTools.")
+                        error_flag = True
+                        break
+                    elif resp.status_code == 403:
+                        st.error("🚫 **403 Forbidden** — Make sure you're logged in to ScanX.")
+                        error_flag = True
+                        break
+                    elif resp.status_code != 200:
+                        st.error(f"❌ HTTP {resp.status_code} on chunk {i+1}: {resp.text[:200]}")
+                        error_flag = True
+                        break
+
+                    raw = resp.json()
+
+                    # Check for API-level errors in response body
+                    if isinstance(raw, dict) and raw.get("code") == -1:
+                        remark = raw.get("remarks", "Unknown API error")
+                        st.error(f"❌ API error on chunk {i+1}: `{remark}`")
+                        error_flag = True
+                        break
+
+                    records = parse_records(raw)
+                    all_records.extend(records)
+                    all_raws.append(raw)
+
+                except requests.exceptions.Timeout:
+                    st.error(f"⏱️ Timeout on chunk {i+1}. Try a smaller date range.")
+                    error_flag = True
+                    break
+                except Exception as e:
+                    st.error(f"Error on chunk {i+1}: {e}")
+                    error_flag = True
+                    break
+
+                # Polite delay between chunks
+                if i < total - 1:
+                    time.sleep(0.5)
+
+            if total > 1:
+                prog_bar.progress(1.0, text="Done!")
+
+            if not error_flag:
+                df = pd.DataFrame(all_records)
+                st.session_state.last_df = df
+                st.session_state.last_raw = all_raws if total > 1 else all_raws[0] if all_raws else {}
+
+                st.session_state.fetch_history.append({
+                    "Time":      ts,
+                    "Segment":   segment_label,
+                    "TimeFrame": timeframe_label,
+                    "From":      from_date.strftime("%d-%m-%Y"),
+                    "To":        to_date.strftime("%d-%m-%Y"),
+                    "Chunks":    total,
+                    "Rows":      len(df),
+                    "Status":    "✅ OK",
+                })
+
+                status_msg.empty()
+                st.success(
+                    f"✅ Fetched **{len(df)} records** "
+                    f"({total} API call{'s' if total > 1 else ''}) at {ts}"
+                )
 
 # ── RESULTS ──────────────────────────────────────────────────────────────────
 
-df = st.session_state.last_df
+df  = st.session_state.last_df
 raw = st.session_state.last_raw
 
 if df is not None and not df.empty:
@@ -393,13 +513,15 @@ if df is not None and not df.empty:
                 hide_index=True,
             )
         else:
-            st.markdown("<p style='color:#484f58;'>No fetches yet this session.</p>",
-                        unsafe_allow_html=True)
+            st.markdown(
+                "<p style='color:#484f58;'>No fetches yet this session.</p>",
+                unsafe_allow_html=True,
+            )
 
 elif df is not None and df.empty:
     st.warning(
         "⚠️ API responded but returned no rows. "
-        "Try the **Custom Payload** override in the sidebar to adjust fields."
+        "Try reducing the date range or check the segment selection."
     )
     if raw:
         st.markdown("**Raw response (for debugging):**")
